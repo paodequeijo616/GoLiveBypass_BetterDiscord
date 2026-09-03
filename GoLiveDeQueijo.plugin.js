@@ -3,8 +3,10 @@
  * @author Pão de Queijo
  * @authorId 416992570846085121
  * @description Plugin BetterDiscord para dar bypass na granja
- * @version 1.6.4
+ * @version 1.6.5
  * @source https://github.com/paodequeijo616/GoLiveBypass_BetterDiscord
+ * @updateUrl https://raw.githubusercontent.com/paodequeijo616/GoLiveBypass_BetterDiscord/main/GoLiveDeQueijo.plugin.js
+ * @downloadUrl https://raw.githubusercontent.com/paodequeijo616/GoLiveBypass_BetterDiscord/main/GoLiveDeQueijo.plugin.js
  */
 
 "use strict";
@@ -14,15 +16,15 @@ const path = require("path");
 
 const VIDEO_GUARD = "2026-08-video-guard";
 const PLUGIN_NAME = "Go Live De Queijo";
-const PLUGIN_VERSION = "1.6.4";
+const PLUGIN_VERSION = "1.6.5";
 const PLUGIN_AUTHOR_ID = "416992570846085121";
 const GITHUB_REPO = "paodequeijo616/GoLiveBypass_BetterDiscord";
 const UPDATE_FILE_NAME = "GoLiveDeQueijo.plugin.js";
 const UPDATE_BRANCH = "main";
-const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const UPDATE_INTERVAL_MS = 30 * 60 * 1000;
 const HOOK_BEGIN = "/* GoLiveBypassBD:NATIVE-HOOK:BEGIN */";
 const HOOK_END = "/* GoLiveBypassBD:NATIVE-HOOK:END */";
-const NATIVE_HOOK_SOURCE = "/*\n * GoLiveBypassBD Native Main Hook\n * Loaded in Discord's main process before BetterDiscord.\n * SPDX-License-Identifier: GPL-3.0-or-later\n *\n * Purpose:\n * - create a localhost SOCKS router\n * - find/test a non-excluded SOCKS5 exit\n * - apply an Electron PAC directly with session.defaultSession.setProxy()\n * - route ONLY Discord gateway hosts through the local router\n * - leave voice/video/CDN/direct traffic alone\n */\n\n\"use strict\";\n\nconst {app, session} = require(\"electron\");\nconst net = require(\"net\");\nconst tls = require(\"tls\");\nconst https = require(\"https\");\nconst fs = require(\"fs\");\nconst path = require(\"path\");\n\nconst BASE = process.env.LOCALAPPDATA\n    ? path.join(process.env.LOCALAPPDATA, \"GoLiveBypassBD\")\n    : path.join(__dirname, \"GoLiveBypassBD\");\n\nconst SETTINGS = path.join(BASE, \"settings.json\");\nconst STATUS = path.join(BASE, \"native-status.json\");\nconst LOG = path.join(BASE, \"native.log\");\n\nconst PROXY_SOURCES = [\n    {\n        type: \"proxyscrape\",\n        url: \"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=socks5&proxy_format=protocolipport&format=json&timeout=1500\"\n    },\n    {\n        type: \"plain\",\n        url: \"https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt\"\n    },\n    {\n        type: \"plain\",\n        url: \"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt\"\n    }\n];\n\nconst PROBE_TIMEOUT = 5500;\nconst SOURCE_TIMEOUT = 6000;\nconst SELECTION_BUDGET = 18000;\nconst HOLD_GATEWAY_MS = 7000;\nconst POOL_SIZE = 4;\nconst MAX_CANDIDATES = 180;\nconst HEARTBEAT_MS = 20000;\n\nlet router = null;\nlet routerPort = 0;\nlet pool = [];\nlet selecting = null;\nlet current = null;\nlet shuttingDown = false;\nlet lastGatewayViaProxy = false;\nlet lastRecoveryReconnectAt = 0;\nlet selectionAttempt = 0;\nlet heartbeatTimer = null;\nlet repairTimer = null;\nlet startupRepairTimer = null;\nconst activeSockets = new Set();\nconst NATIVE_SINGLETON_KEY = \"__GO_LIVE_DE_QUEIJO_NATIVE_STARTED__\";\n\nfunction trackSocket(socket) {\n    if (!socket || typeof socket.once !== \"function\") return socket;\n\n    activeSockets.add(socket);\n\n    socket.once(\"close\", () => {\n        activeSockets.delete(socket);\n    });\n\n    return socket;\n}\n\nfunction clearNativeTimers() {\n    if (heartbeatTimer) {\n        clearInterval(heartbeatTimer);\n        heartbeatTimer = null;\n    }\n\n    if (repairTimer) {\n        clearInterval(repairTimer);\n        repairTimer = null;\n    }\n\n    if (startupRepairTimer) {\n        clearTimeout(startupRepairTimer);\n        startupRepairTimer = null;\n    }\n}\n\nfunction destroyActiveSockets() {\n    for (const socket of [...activeSockets]) {\n        try { socket.destroy(); } catch {}\n    }\n\n    activeSockets.clear();\n}\n\nfunction mkdir() {\n    try { fs.mkdirSync(BASE, {recursive: true}); } catch {}\n}\n\nfunction log(message) {\n    mkdir();\n    const line = `${new Date().toISOString()} ${message}`;\n    try { fs.appendFileSync(LOG, line + \"\\n\"); } catch {}\n    console.log(\"[GoLiveBypassBD/native]\", message);\n}\n\nfunction writeStatus(extra) {\n    mkdir();\n\n    let previous = {};\n\n    try {\n        const parsed = JSON.parse(fs.readFileSync(STATUS, \"utf8\"));\n        if (parsed && typeof parsed === \"object\") previous = parsed;\n    } catch {}\n\n    const body = Object.assign(\n        {},\n        previous,\n        {\n            version: \"1.6.4\",\n            pid: process.pid,\n            updatedAt: new Date().toISOString(),\n            routerPort,\n            pool: pool.map(x => ({\n                proxy: safeProxy(x.proxy),\n                country: x.country || null,\n                ms: x.ms ?? null\n            })),\n            current: current ? {\n                proxy: safeProxy(current.proxy),\n                country: current.country || null,\n                ms: current.ms ?? null\n            } : previous.current || null\n        },\n        extra || {}\n    );\n\n    try {\n        fs.writeFileSync(STATUS, JSON.stringify(body, null, 2), \"utf8\");\n    } catch {}\n}\n\nfunction readSettings() {\n    try {\n        return Object.assign({\n            enabled: true,\n            excludedCountries: \"BR\",\n            manualProxy: \"\"\n        }, JSON.parse(fs.readFileSync(SETTINGS, \"utf8\")));\n    } catch {\n        return {\n            enabled: true,\n            excludedCountries: \"BR\",\n            manualProxy: \"\"\n        };\n    }\n}\n\nfunction excludedSet(settings) {\n    const result = new Set(\n        String(settings.excludedCountries || \"BR\")\n            .split(\",\")\n            .map(x => x.trim().toUpperCase())\n            .filter(x => /^[A-Z]{2}$/.test(x))\n    );\n    if (!result.size) result.add(\"BR\");\n    return result;\n}\n\nfunction parseProxy(value) {\n    const m = /^socks5:\\/\\/(?:(.*?)@)?([^:/?#\\s@]+):(\\d{1,5})$/i.exec(String(value || \"\").trim());\n    if (!m) return null;\n\n    const port = Number(m[3]);\n    if (!(port > 0 && port <= 65535)) return null;\n    if (port === 4145) return null;\n\n    let user = \"\";\n    let pass = \"\";\n\n    if (m[1]) {\n        const i = m[1].indexOf(\":\");\n        const dec = v => {\n            try { return decodeURIComponent(v); } catch { return v; }\n        };\n        user = dec(i < 0 ? m[1] : m[1].slice(0, i));\n        pass = dec(i < 0 ? \"\" : m[1].slice(i + 1));\n    }\n\n    return {\n        scheme: \"socks5\",\n        host: m[2],\n        port,\n        user,\n        pass,\n        raw: String(value).trim()\n    };\n}\n\nfunction safeProxy(proxy) {\n    if (!proxy) return \"nenhuma\";\n    return `socks5://${proxy.user ? proxy.user + \":***@\" : \"\"}${proxy.host}:${proxy.port}`;\n}\n\nfunction routedHost(host) {\n    const h = String(host || \"\").toLowerCase();\n    return h === \"gateway.discord.gg\"\n        || h === \"remote-auth-gateway.discord.gg\"\n        || (h.startsWith(\"gateway-\") && h.endsWith(\".discord.gg\"));\n}\n\nfunction socketTimeout(socket, ms, reject) {\n    socket.setTimeout(ms, () => {\n        try { socket.destroy(); } catch {}\n        reject(new Error(\"timeout\"));\n    });\n}\n\nfunction socks5Tunnel(proxy, host, port, timeout = PROBE_TIMEOUT) {\n    return new Promise((resolve, reject) => {\n        const socket = trackSocket(net.connect(proxy.port, proxy.host));\n        let done = false;\n\n        const fail = error => {\n            if (done) return;\n            done = true;\n            try { socket.destroy(); } catch {}\n            reject(error instanceof Error ? error : new Error(String(error)));\n        };\n\n        socketTimeout(socket, timeout, fail);\n        socket.once(\"error\", fail);\n\n        socket.once(\"connect\", () => {\n            const methods = proxy.user ? [0x00, 0x02] : [0x00];\n            socket.write(Buffer.from([0x05, methods.length, ...methods]));\n\n            socket.once(\"data\", methodReply => {\n                if (methodReply.length < 2 || methodReply[0] !== 0x05) {\n                    return fail(new Error(\"SOCKS5 handshake inválido\"));\n                }\n                if (methodReply[1] === 0xff) {\n                    return fail(new Error(\"SOCKS5 sem método compatível\"));\n                }\n\n                const connectTarget = () => {\n                    const hostBuf = Buffer.from(host, \"utf8\");\n                    if (hostBuf.length > 255) return fail(new Error(\"hostname grande demais\"));\n\n                    const req = Buffer.concat([\n                        Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuf.length]),\n                        hostBuf,\n                        Buffer.from([(port >> 8) & 255, port & 255])\n                    ]);\n\n                    socket.write(req);\n                    socket.once(\"data\", reply => {\n                        if (reply.length < 2 || reply[1] !== 0x00) {\n                            return fail(new Error(`SOCKS5 CONNECT recusado (${reply[1] ?? \"?\"})`));\n                        }\n\n                        if (done) return;\n                        done = true;\n                        socket.setTimeout(0);\n                        socket.removeListener(\"error\", fail);\n                        resolve(socket);\n                    });\n                };\n\n                if (methodReply[1] === 0x02) {\n                    const u = Buffer.from(proxy.user, \"utf8\");\n                    const p = Buffer.from(proxy.pass, \"utf8\");\n\n                    if (u.length > 255 || p.length > 255) {\n                        return fail(new Error(\"credencial SOCKS5 longa demais\"));\n                    }\n\n                    socket.write(Buffer.concat([\n                        Buffer.from([0x01, u.length]),\n                        u,\n                        Buffer.from([p.length]),\n                        p\n                    ]));\n\n                    socket.once(\"data\", authReply => {\n                        if (authReply.length < 2 || authReply[1] !== 0x00) {\n                            return fail(new Error(\"autenticação SOCKS5 recusada\"));\n                        }\n                        connectTarget();\n                    });\n                } else {\n                    connectTarget();\n                }\n            });\n        });\n    });\n}\n\nasync function tlsProbe(proxy, hostname) {\n    const start = Date.now();\n    const raw = await socks5Tunnel(proxy, hostname, 443);\n\n    return await new Promise((resolve, reject) => {\n        let settled = false;\n\n        const secure = tls.connect({\n            socket: raw,\n            servername: hostname,\n            rejectUnauthorized: true\n        });\n\n        const fail = e => {\n            if (settled) return;\n            settled = true;\n            try { secure.destroy(); } catch {}\n            reject(e instanceof Error ? e : new Error(String(e)));\n        };\n\n        socketTimeout(secure, PROBE_TIMEOUT, fail);\n        secure.once(\"error\", fail);\n        secure.once(\"secureConnect\", () => {\n            if (settled) return;\n            settled = true;\n            secure.setTimeout(0);\n            secure.destroy();\n            resolve(Date.now() - start);\n        });\n    });\n}\n\nasync function countryThrough(proxy) {\n    const raw = await socks5Tunnel(proxy, \"cloudflare.com\", 443);\n\n    return await new Promise((resolve, reject) => {\n        let settled = false;\n        let data = \"\";\n\n        const secure = tls.connect({\n            socket: raw,\n            servername: \"cloudflare.com\",\n            rejectUnauthorized: true\n        });\n\n        const fail = e => {\n            if (settled) return;\n            settled = true;\n            try { secure.destroy(); } catch {}\n            reject(e instanceof Error ? e : new Error(String(e)));\n        };\n\n        socketTimeout(secure, PROBE_TIMEOUT, fail);\n        secure.once(\"error\", fail);\n\n        secure.once(\"secureConnect\", () => {\n            secure.write(\n                \"GET /cdn-cgi/trace HTTP/1.1\\r\\n\" +\n                \"Host: cloudflare.com\\r\\n\" +\n                \"Connection: close\\r\\n\\r\\n\"\n            );\n        });\n\n        secure.on(\"data\", chunk => {\n            data += chunk.toString(\"utf8\");\n            if (data.length > 20000) fail(new Error(\"trace grande demais\"));\n        });\n\n        secure.on(\"end\", () => {\n            if (settled) return;\n            const m = /\\bloc=([A-Z]{2})\\b/.exec(data);\n            if (!m) return fail(new Error(\"país não identificado\"));\n            settled = true;\n            resolve(m[1]);\n        });\n    });\n}\n\nasync function probeExit(proxy, excluded) {\n    const started = Date.now();\n\n    const country = await countryThrough(proxy);\n    if (excluded.has(country)) {\n        throw new Error(`país excluído: ${country}`);\n    }\n\n    await tlsProbe(proxy, \"gateway.discord.gg\");\n\n    return {\n        proxy,\n        country,\n        ms: Date.now() - started\n    };\n}\n\nfunction downloadText(url, timeout = SOURCE_TIMEOUT) {\n    return new Promise((resolve, reject) => {\n        const req = https.get(url, {\n            headers: {\n                \"User-Agent\": \"GoLiveBypassBD/1.6.4\"\n            }\n        }, res => {\n            if (res.statusCode < 200 || res.statusCode >= 300) {\n                res.resume();\n                reject(new Error(`HTTP ${res.statusCode}`));\n                return;\n            }\n\n            let body = \"\";\n            res.setEncoding(\"utf8\");\n\n            res.on(\"data\", chunk => {\n                body += chunk;\n                if (body.length > 4_000_000) {\n                    req.destroy(new Error(\"resposta grande demais\"));\n                }\n            });\n\n            res.on(\"end\", () => resolve(body));\n        });\n\n        req.setTimeout(timeout, () => req.destroy(new Error(\"timeout da fonte\")));\n        req.on(\"error\", reject);\n    });\n}\n\nfunction parseSource(type, body) {\n    const out = [];\n\n    if (type === \"plain\") {\n        for (const line of body.split(/\\r?\\n/)) {\n            const raw = line.trim();\n            if (!raw || raw.startsWith(\"#\")) continue;\n            const p = parseProxy(raw.includes(\"://\") ? raw : `socks5://${raw}`);\n            if (p) out.push(p);\n        }\n        return out;\n    }\n\n    const data = JSON.parse(body);\n    const entries = Array.isArray(data.proxies) ? data.proxies : [];\n\n    for (const item of entries) {\n        const p = parseProxy(String(item?.proxy || \"\"));\n        if (p) out.push(p);\n    }\n\n    return out;\n}\n\nfunction shuffled(list) {\n    const out = [...list];\n\n    for (let i = out.length - 1; i > 0; i--) {\n        const j = Math.floor(Math.random() * (i + 1));\n        [out[i], out[j]] = [out[j], out[i]];\n    }\n\n    return out;\n}\n\nasync function proxyCandidates(settings) {\n    const manualRaw = String(settings.manualProxy || \"\").trim();\n\n    if (manualRaw) {\n        const manual = parseProxy(manualRaw);\n        if (!manual) throw new Error(\"proxy manual inválida\");\n        return [manual];\n    }\n\n    const chunks = await Promise.all(\n        PROXY_SOURCES.map(async src => {\n            try {\n                const body = await downloadText(src.url);\n                log(`fonte ${src.type} ok (${body.length} bytes)`);\n                return parseSource(src.type, body);\n            } catch (e) {\n                log(`fonte ${src.type} falhou: ${e.message}`);\n                return [];\n            }\n        })\n    );\n\n    const unique = new Map();\n\n    for (const list of chunks) {\n        for (const proxy of list) {\n            const key = `${proxy.host}:${proxy.port}`;\n            if (!unique.has(key)) unique.set(key, proxy);\n        }\n    }\n\n    const all = [...unique.values()];\n    const picked = shuffled(all).slice(0, MAX_CANDIDATES);\n\n    writeStatus({\n        proxyCandidatesTotal: all.length,\n        proxyCandidatesTesting: picked.length\n    });\n\n    return picked;\n}\n\nfunction readStatusFile() {\n    try {\n        const parsed = JSON.parse(fs.readFileSync(STATUS, \"utf8\"));\n        return parsed && typeof parsed === \"object\" ? parsed : {};\n    } catch {\n        return {};\n    }\n}\n\nasync function reconnectGatewayAfterLateExit() {\n    const status = readStatusFile();\n\n    if (!status.pacActive) return false;\n    if (!status.directFallback && status.gatewayViaProxy !== false) return false;\n    if (!current) return false;\n\n    // Avoid reload/reconnect loops when several proxy probes finish together.\n    if (Date.now() - lastRecoveryReconnectAt < 15000) return false;\n    lastRecoveryReconnectAt = Date.now();\n\n    try {\n        const forcedAt = new Date().toISOString();\n\n        writeStatus({\n            state: \"late-exit-reconnecting\",\n            directFallback: false,\n            gatewayViaProxy: null,\n            directReason: null,\n            recoveryProxy: safeProxy(current.proxy),\n            recoveryCountry: current.country,\n            gatewayReconnectForcedAt: forcedAt,\n            gatewayReconnectReason: \"late-exit\"\n        });\n\n        await session.defaultSession.closeAllConnections();\n\n        log(\n            `saída ficou pronta depois do DIRECT; fechando conexões para ` +\n            `o Gateway renascer por ${safeProxy(current.proxy)} (${current.country})`\n        );\n\n        return true;\n    } catch (e) {\n        log(`reconexão após saída tardia falhou: ${e.message}`);\n        return false;\n    }\n}\n\nasync function selectPool(force = false) {\n    // Never run two large proxy scans at the same time. \"force\" means retry\n    // when idle, not duplicate an in-flight selection.\n    if (selecting) return selecting;\n\n    selecting = (async () => {\n        selectionAttempt++;\n\n        const settings = readSettings();\n        const excluded = excludedSet(settings);\n\n        writeStatus({\n            state: \"selecting-exit\",\n            proxyAttempt: selectionAttempt,\n            proxySelectionError: null\n        });\n\n        const candidates = await proxyCandidates(settings);\n        if (!candidates.length) throw new Error(\"nenhuma proxy candidata\");\n\n        const start = Date.now();\n        const winners = [];\n        let cursor = 0;\n        const workerCount = Math.min(28, candidates.length);\n\n        const workers = Array.from({length: workerCount}, async () => {\n            while (\n                Date.now() - start < SELECTION_BUDGET &&\n                winners.length < POOL_SIZE\n            ) {\n                const i = cursor++;\n                if (i >= candidates.length) return;\n\n                const proxy = candidates[i];\n\n                try {\n                    const result = await probeExit(proxy, excluded);\n                    winners.push(result);\n\n                    log(`proxy aprovada ${safeProxy(proxy)} país=${result.country} ${result.ms}ms`);\n\n                    // Do not wait for the whole batch. The first validated exit\n                    // can already serve the waiting Discord Gateway.\n                    if (!current) {\n                        current = result;\n                        pool = [result];\n\n                        writeStatus({\n                            state: \"exit-ready-early\",\n                            country: result.country,\n                            proxy: safeProxy(result.proxy),\n                            ms: result.ms,\n                            proxyAttempt: selectionAttempt\n                        });\n\n                        void reconnectGatewayAfterLateExit();\n                    }\n                } catch (e) {\n                    log(`proxy rejeitada ${safeProxy(proxy)}: ${e.message}`);\n                }\n            }\n        });\n\n        await Promise.allSettled(workers);\n\n        if (!winners.length) {\n            const message = \"nenhuma saída não-BR respondeu ao Gateway\";\n\n            writeStatus({\n                state: \"proxy-search-failed\",\n                proxyAttempt: selectionAttempt,\n                proxySelectionError: message\n            });\n\n            throw new Error(message);\n        }\n\n        winners.sort((a, b) => a.ms - b.ms);\n\n        pool = winners.slice(0, POOL_SIZE);\n\n        if (!current || !winners.includes(current)) {\n            current = pool[0];\n        }\n\n        writeStatus({\n            state: \"exit-ready\",\n            country: current.country,\n            proxy: safeProxy(current.proxy),\n            ms: current.ms,\n            proxyAttempt: selectionAttempt,\n            proxySelectionError: null\n        });\n\n        // If the Gateway already gave up waiting and opened DIRECT, a usable\n        // exit becoming ready later must trigger a fresh Gateway connection.\n        void reconnectGatewayAfterLateExit();\n\n        return pool;\n    })().finally(() => {\n        selecting = null;\n    });\n\n    return selecting;\n}\n\nfunction waitForExit(timeout = HOLD_GATEWAY_MS) {\n    if (current) return Promise.resolve(current);\n\n    return new Promise(resolve => {\n        const start = Date.now();\n\n        const tick = () => {\n            if (current) return resolve(current);\n            if (Date.now() - start >= timeout) return resolve(null);\n            setTimeout(tick, 100);\n        };\n\n        tick();\n    });\n}\n\nfunction readSocksClientRequest(client) {\n    return new Promise((resolve, reject) => {\n        let stage = 0;\n        let buffer = Buffer.alloc(0);\n\n        const cleanup = () => {\n            client.off(\"data\", onData);\n            client.off(\"error\", onError);\n            client.setTimeout(0);\n        };\n\n        const fail = e => {\n            cleanup();\n            reject(e instanceof Error ? e : new Error(String(e)));\n        };\n\n        const onError = fail;\n\n        const onData = chunk => {\n            buffer = Buffer.concat([buffer, chunk]);\n\n            if (buffer.length > 8192) {\n                fail(new Error(\"handshake SOCKS grande demais\"));\n                return;\n            }\n\n            try {\n                if (stage === 0) {\n                    if (buffer.length < 2) return;\n                    const count = buffer[1];\n                    if (buffer.length < 2 + count) return;\n\n                    client.write(Buffer.from([0x05, 0x00]));\n                    buffer = buffer.subarray(2 + count);\n                    stage = 1;\n                }\n\n                if (stage !== 1) return;\n                if (buffer.length < 5) return;\n\n                if (buffer[0] !== 0x05 || buffer[1] !== 0x01) {\n                    throw new Error(\"apenas SOCKS CONNECT suportado\");\n                }\n\n                const atyp = buffer[3];\n                let host;\n                let offset;\n\n                if (atyp === 0x01) {\n                    if (buffer.length < 10) return;\n                    host = `${buffer[4]}.${buffer[5]}.${buffer[6]}.${buffer[7]}`;\n                    offset = 8;\n                } else if (atyp === 0x03) {\n                    const len = buffer[4];\n                    if (buffer.length < 7 + len) return;\n                    host = buffer.subarray(5, 5 + len).toString(\"utf8\");\n                    offset = 5 + len;\n                } else {\n                    throw new Error(\"ATYP não suportado\");\n                }\n\n                const port = (buffer[offset] << 8) | buffer[offset + 1];\n\n                cleanup();\n                resolve({host, port});\n            } catch (e) {\n                fail(e);\n            }\n        };\n\n        client.setTimeout(15000, () => fail(new Error(\"timeout cliente SOCKS\")));\n        client.on(\"error\", onError);\n        client.on(\"data\", onData);\n    });\n}\n\nfunction directConnect(host, port, timeout = 6000) {\n    return new Promise((resolve, reject) => {\n        const socket = trackSocket(net.connect(port, host));\n        let done = false;\n\n        const fail = error => {\n            if (done) return;\n            done = true;\n            try { socket.destroy(); } catch {}\n            reject(error instanceof Error ? error : new Error(String(error)));\n        };\n\n        socket.setTimeout(timeout, () => fail(new Error(\"timeout DIRECT\")));\n        socket.once(\"error\", fail);\n\n        socket.once(\"connect\", () => {\n            if (done) return;\n            done = true;\n            socket.setTimeout(0);\n            socket.removeListener(\"error\", fail);\n            resolve(socket);\n        });\n    });\n}\n\nasync function openDirectFallback(host, port, reason) {\n    lastGatewayViaProxy = false;\n\n    log(`FALLBACK DIRECT para ${host}:${port}: ${reason}`);\n\n    writeStatus({\n        state: \"degraded-direct\",\n        directFallback: true,\n        gatewayViaProxy: false,\n        directReason: reason,\n        directAt: new Date().toISOString()\n    });\n\n    return directConnect(host, port);\n}\n\nasync function openThroughPool(host, port) {\n    const ready = await waitForExit(HOLD_GATEWAY_MS);\n\n    if (!ready) {\n        selectPool(true).catch(e => log(`refresh após espera falhou: ${e.message}`));\n        return openDirectFallback(host, port, \"nenhuma saída proxy ficou pronta a tempo\");\n    }\n\n    const ordered = [];\n\n    if (current) ordered.push(current);\n\n    for (const item of pool) {\n        if (!ordered.includes(item)) ordered.push(item);\n    }\n\n    let last = null;\n\n    for (const item of ordered) {\n        try {\n            const socket = await socks5Tunnel(item.proxy, host, port, 6000);\n\n            lastGatewayViaProxy = true;\n\n            if (current !== item) {\n                current = item;\n                log(`saída trocada para ${safeProxy(item.proxy)}`);\n            }\n\n            writeStatus({\n                state: \"exit-in-use\",\n                directFallback: false,\n                gatewayViaProxy: true,\n                directReason: null\n            });\n\n            return socket;\n        } catch (e) {\n            last = e;\n            log(`saída ${safeProxy(item.proxy)} falhou no tráfego vivo: ${e.message}`);\n            pool = pool.filter(x => x !== item);\n\n            if (current === item) current = null;\n        }\n    }\n\n    selectPool(true).catch(e => log(`refresh de pool falhou: ${e.message}`));\n\n    return openDirectFallback(\n        host,\n        port,\n        last?.message || \"pool de proxies esgotado\"\n    );\n}\n\nasync function handleRouterClient(client) {\n    try {\n        const request = await readSocksClientRequest(client);\n\n        if (!routedHost(request.host)) {\n            client.write(Buffer.from([0x05, 0x02, 0, 1, 0,0,0,0, 0,0]));\n            client.destroy();\n            return;\n        }\n\n        log(`gateway visto: ${request.host}:${request.port}`);\n\n        const remote = await openThroughPool(request.host, request.port);\n\n        client.write(Buffer.from([0x05, 0x00, 0, 1, 127,0,0,1, 0,0]));\n        client.pipe(remote);\n        remote.pipe(client);\n\n        remote.on(\"error\", () => {\n            try { client.destroy(); } catch {}\n        });\n\n        client.on(\"error\", () => {\n            try { remote.destroy(); } catch {}\n        });\n\n        writeStatus({\n            state: \"gateway-routed\",\n            lastGatewayHost: request.host,\n            lastGatewayAt: new Date().toISOString(),\n            gatewayViaProxy: lastGatewayViaProxy,\n            directFallback: !lastGatewayViaProxy,\n            directReason: lastGatewayViaProxy\n                ? null\n                : \"gateway atual abriu em DIRECT\"\n        });\n    } catch (e) {\n        log(`router: ${e.message}`);\n\n        try {\n            client.write(Buffer.from([0x05, 0x01, 0, 1, 0,0,0,0, 0,0]));\n        } catch {}\n\n        try { client.destroy(); } catch {}\n    }\n}\n\nasync function startRouter() {\n    if (router) return router;\n\n    router = net.createServer(client => {\n        trackSocket(client);\n        handleRouterClient(client).catch(e => log(`cliente router: ${e.message}`));\n    });\n\n    await new Promise((resolve, reject) => {\n        router.once(\"error\", reject);\n        router.listen(0, \"127.0.0.1\", resolve);\n    });\n\n    routerPort = router.address().port;\n    log(`roteador local pronto em 127.0.0.1:${routerPort}`);\n\n    writeStatus({\n        state: \"router-ready\",\n        routerPort\n    });\n\n    return router;\n}\n\nfunction pacSource(fallback) {\n    return `\nfunction FindProxyForURL(url, host) {\n    host = String(host || \"\").toLowerCase();\n\n    if (\n        host === \"gateway.discord.gg\" ||\n        host === \"remote-auth-gateway.discord.gg\" ||\n        (host.indexOf(\"gateway-\") === 0 && dnsDomainIs(host, \".discord.gg\"))\n    ) {\n        return \"SOCKS5 127.0.0.1:${routerPort}\";\n    }\n\n    return ${JSON.stringify(fallback)};\n}\n`.trim();\n}\n\nasync function installPac() {\n    let fallback = \"DIRECT\";\n\n    try {\n        const system = await session.defaultSession.resolveProxy(\"https://discord.com\");\n        if (typeof system === \"string\" && system.trim()) {\n            fallback = system.trim();\n        }\n    } catch (e) {\n        log(`não consegui ler proxy do sistema: ${e.message}`);\n    }\n\n    const source = pacSource(fallback);\n    const url = \"data:application/x-ns-proxy-autoconfig;base64,\"\n        + Buffer.from(source, \"utf8\").toString(\"base64\");\n\n    await session.defaultSession.setProxy({\n        mode: \"pac_script\",\n        pacScript: url\n    });\n\n    const checks = await Promise.all([\n        session.defaultSession.resolveProxy(\"https://gateway.discord.gg\"),\n        session.defaultSession.resolveProxy(\"https://gateway-us-east1-b.discord.gg\"),\n        session.defaultSession.resolveProxy(\"https://discord.com\")\n    ]);\n\n    const gatewayOk = checks[0].includes(String(routerPort))\n        && checks[1].includes(String(routerPort));\n\n    if (!gatewayOk) {\n        await session.defaultSession.setProxy({mode: \"system\"});\n        throw new Error(`PAC não foi aplicada: ${checks.join(\" | \")}`);\n    }\n\n    log(`PAC nativa ativa: gateway -> 127.0.0.1:${routerPort}; resto -> ${fallback}`);\n\n    writeStatus({\n        state: \"pac-active\",\n        pacActive: true,\n        resolveGateway: checks[0],\n        resolveRegionalGateway: checks[1],\n        resolveDiscordCom: checks[2]\n    });\n\n}\n\nasync function forceGatewayReconnectAfterProxyReady() {\n    if (!current) {\n        writeStatus({\n            state: \"degraded-direct\",\n            directFallback: true,\n            directReason: \"nenhuma proxy validada; conexão atual não será derrubada\"\n        });\n        return false;\n    }\n\n    // v1.6.3 could close every Electron connection even after the Gateway had\n    // ALREADY completed its SOCKS route. That second reconnect is unnecessary\n    // and can leave Discord voice/RTC state waiting forever.\n    const status = readStatusFile();\n    const lastGatewayAt = new Date(status.lastGatewayAt || 0).getTime();\n    const gatewayIsFresh =\n        Number.isFinite(lastGatewayAt) &&\n        lastGatewayAt > 0 &&\n        Date.now() - lastGatewayAt < 45_000;\n\n    if (\n        status.gatewayViaProxy === true &&\n        status.directFallback !== true &&\n        gatewayIsFresh\n    ) {\n        log(\n            `gateway já está pela proxy ${safeProxy(current.proxy)} ` +\n            `(${current.country}); reconexão extra ignorada`\n        );\n\n        writeStatus({\n            state: \"gateway-already-proxied\",\n            directFallback: false,\n            gatewayViaProxy: true,\n            directReason: null,\n            country: current.country,\n            proxy: safeProxy(current.proxy),\n            ms: current.ms,\n            gatewayReconnectSkipped: true,\n            gatewayReconnectSkipReason: \"gateway já roteado pela proxy\"\n        });\n\n        return true;\n    }\n\n    try {\n        const forcedAt = new Date().toISOString();\n\n        writeStatus({\n            state: \"proxy-ready-reconnecting\",\n            directFallback: false,\n            gatewayViaProxy: null,\n            directReason: null,\n            country: current.country,\n            proxy: safeProxy(current.proxy),\n            ms: current.ms,\n            gatewayReconnectForcedAt: forcedAt,\n            gatewayReconnectReason: \"proxy-ready\",\n            gatewayReconnectSkipped: false\n        });\n\n        await session.defaultSession.closeAllConnections();\n\n        log(\n            `proxy pronta (${current.country}); conexões antigas fechadas ` +\n            \"porque o Gateway ainda não estava confirmado pela proxy\"\n        );\n\n        lastGatewayViaProxy = false;\n\n        return true;\n    } catch (e) {\n        log(`closeAllConnections falhou: ${e.message}`);\n        return false;\n    }\n}\n\nasync function heartbeat() {\n    if (shuttingDown) return;\n\n    if (!current) {\n        try {\n            await selectPool(true);\n        } catch (e) {\n            log(`heartbeat sem saída: ${e.message}`);\n\n            writeStatus({\n                state: \"degraded-direct\",\n                proxyAttempt: selectionAttempt,\n                proxySelectionError: e.message\n            });\n        }\n\n        return;\n    }\n\n    try {\n        const ms = await tlsProbe(current.proxy, \"gateway.discord.gg\");\n        current.ms = ms;\n\n        writeStatus({\n            state: \"healthy\",\n            heartbeatMs: ms\n        });\n    } catch (e) {\n        log(`heartbeat derrubou ${safeProxy(current.proxy)}: ${e.message}`);\n\n        pool = pool.filter(x => x !== current);\n        current = pool[0] || null;\n\n        if (!current) {\n            try { await selectPool(true); } catch (refreshError) {\n                log(`não consegui repor pool: ${refreshError.message}`);\n            }\n        }\n\n        writeStatus({state: \"exit-degraded\"});\n    }\n}\n\nconst SELF_HOOK_BEGIN = \"/* GoLiveBypassBD:NATIVE-HOOK:BEGIN */\";\nconst SELF_HOOK_END = \"/* GoLiveBypassBD:NATIVE-HOOK:END */\";\n\nfunction stripSelfMarker(content) {\n    const begin = content.indexOf(SELF_HOOK_BEGIN);\n    if (begin < 0) return content;\n\n    const end = content.indexOf(SELF_HOOK_END, begin);\n    if (end < 0) return content;\n\n    return content.slice(0, begin)\n        + content.slice(end + SELF_HOOK_END.length).replace(/^\\r?\\n/, \"\");\n}\n\nfunction selfMarkerBlock() {\n    return [\n        SELF_HOOK_BEGIN,\n        \"try { require(\" + JSON.stringify(__filename) + \"); }\",\n        \"catch (e) { console.error('[GoLiveBypassBD/native-hook]', e); }\",\n        SELF_HOOK_END,\n        \"\"\n    ].join(\"\\n\");\n}\n\nfunction repairOwnInjection() {\n    const settings = readSettings();\n    const coreIndex = String(settings.coreIndex || \"\").trim();\n\n    if (!coreIndex) {\n        writeStatus({\n            injectionPersistent: false,\n            injectionReason: \"coreIndex ausente no settings.json\"\n        });\n        return false;\n    }\n\n    try {\n        if (!fs.existsSync(coreIndex)) {\n            writeStatus({\n                injectionPersistent: false,\n                injectionReason: \"coreIndex não existe: \" + coreIndex\n            });\n            return false;\n        }\n\n        const original = fs.readFileSync(coreIndex, \"utf8\");\n\n        const escapedSelfPath = JSON.stringify(__filename);\n\n        if (\n            original.includes(SELF_HOOK_BEGIN) &&\n            original.includes(SELF_HOOK_END) &&\n            original.includes(escapedSelfPath)\n        ) {\n            writeStatus({\n                injectionPersistent: true,\n                injectionPath: coreIndex,\n                injectionReason: null\n            });\n            return true;\n        }\n\n        const clean = stripSelfMarker(original);\n        const wanted = selfMarkerBlock() + clean;\n\n        fs.writeFileSync(coreIndex, wanted, \"utf8\");\n\n        const verify = fs.readFileSync(coreIndex, \"utf8\");\n        const ok = verify.includes(SELF_HOOK_BEGIN)\n            && verify.includes(SELF_HOOK_END)\n            && verify.includes(escapedSelfPath);\n\n        writeStatus({\n            injectionPersistent: ok,\n            injectionPath: coreIndex,\n            injectionReason: ok ? null : \"verificação após write falhou\"\n        });\n\n        if (ok) {\n            log(`injeção persistente reparada em ${coreIndex}`);\n        }\n\n        return ok;\n    } catch (e) {\n        log(`self-heal da injeção falhou: ${e.message}`);\n\n        writeStatus({\n            injectionPersistent: false,\n            injectionPath: coreIndex,\n            injectionReason: e.message\n        });\n\n        return false;\n    }\n}\n\nasync function start() {\n    mkdir();\n\n    const settings = readSettings();\n\n    log(\"--- main hook v1.6.4 carregado ---\");\n\n    writeStatus({\n        state: \"hook-loaded\",\n        hookLoaded: true,\n        enabled: settings.enabled !== false,\n        electron: process.versions.electron || null,\n        directFallback: false\n    });\n\n    if (settings.enabled === false) {\n        log(\"hook desativado pelas configurações\");\n        return;\n    }\n\n    await startRouter();\n\n    // Start proxy discovery BEFORE installing the PAC. Discovery traffic therefore\n    // uses the normal system route and gets a head start before the Gateway is moved.\n    const selectionPromise = selectPool()\n        .then(result => result)\n        .catch(e => {\n            log(`seleção inicial falhou: ${e.message}`);\n\n            writeStatus({\n                state: \"degraded-direct\",\n                directFallback: true,\n                directReason: e.message,\n                error: e.message\n            });\n\n            return null;\n        });\n\n    try {\n        await installPac();\n    } catch (e) {\n        // If PAC itself cannot be installed, do not damage the Discord session.\n        log(`PAC não pôde ser instalada; mantendo rede normal: ${e.message}`);\n\n        try {\n            await session.defaultSession.setProxy({mode: \"system\"});\n        } catch {}\n\n        writeStatus({\n            state: \"pac-error-direct\",\n            pacActive: false,\n            directFallback: true,\n            directReason: e.message,\n            error: e.message\n        });\n\n        return;\n    }\n\n    // Only tear down the existing Gateway after an exit has actually been validated.\n    const selected = await selectionPromise;\n\n    if (selected && current) {\n        await forceGatewayReconnectAfterProxyReady();\n    } else {\n        log(\"nenhuma proxy validada; Discord continuará em modo degradado/DIRECT\");\n\n        writeStatus({\n            state: \"degraded-direct\",\n            pacActive: true,\n            directFallback: true,\n            directReason: \"nenhuma saída não-BR validada\"\n        });\n    }\n\n    // BetterDiscord/Discord may rewrite discord_desktop_core during startup.\n    // Repair our one-line loader after the client settles so the next restart\n    // still loads the native hook.\n    clearNativeTimers();\n\n    startupRepairTimer = setTimeout(() => {\n        startupRepairTimer = null;\n        repairOwnInjection();\n    }, 5000);\n\n    heartbeatTimer = setInterval(() => {\n        heartbeat().catch(e => log(`heartbeat interno: ${e.message}`));\n    }, HEARTBEAT_MS);\n\n    // Re-check persistence occasionally; this only writes when the marker vanished.\n    repairTimer = setInterval(() => {\n        repairOwnInjection();\n    }, 60000);\n}\n\nfunction begin() {\n    if (globalThis[NATIVE_SINGLETON_KEY]) {\n        log(\"hook nativo já estava ativo neste processo; ignorando segunda inicialização\");\n        return;\n    }\n\n    globalThis[NATIVE_SINGLETON_KEY] = true;\n\n    start().catch(e => {\n        log(`FATAL: ${e.stack || e.message}`);\n        writeStatus({\n            state: \"fatal\",\n            error: e.message\n        });\n    });\n}\n\napp.once(\"before-quit\", () => {\n    shuttingDown = true;\n\n    clearNativeTimers();\n    destroyActiveSockets();\n\n    try { router?.close(); } catch {}\n    router = null;\n\n    globalThis[NATIVE_SINGLETON_KEY] = false;\n});\n\n// This module is loaded by discord_desktop_core very early.\nif (app.isReady()) {\n    begin();\n} else {\n    app.once(\"ready\", begin);\n}\n";
+const NATIVE_HOOK_SOURCE = "/*\n * GoLiveBypassBD Native Main Hook\n * Loaded in Discord's main process before BetterDiscord.\n * SPDX-License-Identifier: GPL-3.0-or-later\n *\n * Purpose:\n * - create a localhost SOCKS router\n * - find/test a non-excluded SOCKS5 exit\n * - apply an Electron PAC directly with session.defaultSession.setProxy()\n * - route ONLY Discord gateway hosts through the local router\n * - leave voice/video/CDN/direct traffic alone\n */\n\n\"use strict\";\n\nconst {app, session} = require(\"electron\");\nconst net = require(\"net\");\nconst tls = require(\"tls\");\nconst https = require(\"https\");\nconst fs = require(\"fs\");\nconst path = require(\"path\");\n\nconst BASE = process.env.LOCALAPPDATA\n    ? path.join(process.env.LOCALAPPDATA, \"GoLiveBypassBD\")\n    : path.join(__dirname, \"GoLiveBypassBD\");\n\nconst SETTINGS = path.join(BASE, \"settings.json\");\nconst STATUS = path.join(BASE, \"native-status.json\");\nconst LOG = path.join(BASE, \"native.log\");\n\nconst PROXY_SOURCES = [\n    {\n        type: \"proxyscrape\",\n        url: \"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=socks5&proxy_format=protocolipport&format=json&timeout=1500\"\n    },\n    {\n        type: \"plain\",\n        url: \"https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt\"\n    },\n    {\n        type: \"plain\",\n        url: \"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt\"\n    }\n];\n\nconst PROBE_TIMEOUT = 5500;\nconst SOURCE_TIMEOUT = 6000;\nconst SELECTION_BUDGET = 18000;\nconst HOLD_GATEWAY_MS = 7000;\nconst POOL_SIZE = 4;\nconst MAX_CANDIDATES = 180;\nconst HEARTBEAT_MS = 20000;\n\nlet router = null;\nlet routerPort = 0;\nlet pool = [];\nlet selecting = null;\nlet current = null;\nlet shuttingDown = false;\nlet lastGatewayViaProxy = false;\nlet lastRecoveryReconnectAt = 0;\nlet selectionAttempt = 0;\nlet heartbeatTimer = null;\nlet repairTimer = null;\nlet startupRepairTimer = null;\nconst activeSockets = new Set();\nconst NATIVE_SINGLETON_KEY = \"__GO_LIVE_DE_QUEIJO_NATIVE_STARTED__\";\n\nfunction trackSocket(socket) {\n    if (!socket || typeof socket.once !== \"function\") return socket;\n\n    activeSockets.add(socket);\n\n    socket.once(\"close\", () => {\n        activeSockets.delete(socket);\n    });\n\n    return socket;\n}\n\nfunction clearNativeTimers() {\n    if (heartbeatTimer) {\n        clearInterval(heartbeatTimer);\n        heartbeatTimer = null;\n    }\n\n    if (repairTimer) {\n        clearInterval(repairTimer);\n        repairTimer = null;\n    }\n\n    if (startupRepairTimer) {\n        clearTimeout(startupRepairTimer);\n        startupRepairTimer = null;\n    }\n}\n\nfunction destroyActiveSockets() {\n    for (const socket of [...activeSockets]) {\n        try { socket.destroy(); } catch {}\n    }\n\n    activeSockets.clear();\n}\n\nfunction mkdir() {\n    try { fs.mkdirSync(BASE, {recursive: true}); } catch {}\n}\n\nfunction log(message) {\n    mkdir();\n    const line = `${new Date().toISOString()} ${message}`;\n    try { fs.appendFileSync(LOG, line + \"\\n\"); } catch {}\n    console.log(\"[GoLiveBypassBD/native]\", message);\n}\n\nfunction writeStatus(extra) {\n    mkdir();\n\n    let previous = {};\n\n    try {\n        const parsed = JSON.parse(fs.readFileSync(STATUS, \"utf8\"));\n        if (parsed && typeof parsed === \"object\") previous = parsed;\n    } catch {}\n\n    const body = Object.assign(\n        {},\n        previous,\n        {\n            version: \"1.6.5\",\n            pid: process.pid,\n            updatedAt: new Date().toISOString(),\n            routerPort,\n            pool: pool.map(x => ({\n                proxy: safeProxy(x.proxy),\n                country: x.country || null,\n                ms: x.ms ?? null\n            })),\n            current: current ? {\n                proxy: safeProxy(current.proxy),\n                country: current.country || null,\n                ms: current.ms ?? null\n            } : previous.current || null\n        },\n        extra || {}\n    );\n\n    try {\n        fs.writeFileSync(STATUS, JSON.stringify(body, null, 2), \"utf8\");\n    } catch {}\n}\n\nfunction readSettings() {\n    try {\n        return Object.assign({\n            enabled: true,\n            excludedCountries: \"BR\",\n            manualProxy: \"\"\n        }, JSON.parse(fs.readFileSync(SETTINGS, \"utf8\")));\n    } catch {\n        return {\n            enabled: true,\n            excludedCountries: \"BR\",\n            manualProxy: \"\"\n        };\n    }\n}\n\nfunction excludedSet(settings) {\n    const result = new Set(\n        String(settings.excludedCountries || \"BR\")\n            .split(\",\")\n            .map(x => x.trim().toUpperCase())\n            .filter(x => /^[A-Z]{2}$/.test(x))\n    );\n    if (!result.size) result.add(\"BR\");\n    return result;\n}\n\nfunction parseProxy(value) {\n    const m = /^socks5:\\/\\/(?:(.*?)@)?([^:/?#\\s@]+):(\\d{1,5})$/i.exec(String(value || \"\").trim());\n    if (!m) return null;\n\n    const port = Number(m[3]);\n    if (!(port > 0 && port <= 65535)) return null;\n    if (port === 4145) return null;\n\n    let user = \"\";\n    let pass = \"\";\n\n    if (m[1]) {\n        const i = m[1].indexOf(\":\");\n        const dec = v => {\n            try { return decodeURIComponent(v); } catch { return v; }\n        };\n        user = dec(i < 0 ? m[1] : m[1].slice(0, i));\n        pass = dec(i < 0 ? \"\" : m[1].slice(i + 1));\n    }\n\n    return {\n        scheme: \"socks5\",\n        host: m[2],\n        port,\n        user,\n        pass,\n        raw: String(value).trim()\n    };\n}\n\nfunction safeProxy(proxy) {\n    if (!proxy) return \"nenhuma\";\n    return `socks5://${proxy.user ? proxy.user + \":***@\" : \"\"}${proxy.host}:${proxy.port}`;\n}\n\nfunction routedHost(host) {\n    const h = String(host || \"\").toLowerCase();\n    return h === \"gateway.discord.gg\"\n        || h === \"remote-auth-gateway.discord.gg\"\n        || (h.startsWith(\"gateway-\") && h.endsWith(\".discord.gg\"));\n}\n\nfunction socketTimeout(socket, ms, reject) {\n    socket.setTimeout(ms, () => {\n        try { socket.destroy(); } catch {}\n        reject(new Error(\"timeout\"));\n    });\n}\n\nfunction socks5Tunnel(proxy, host, port, timeout = PROBE_TIMEOUT) {\n    return new Promise((resolve, reject) => {\n        const socket = trackSocket(net.connect(proxy.port, proxy.host));\n        let done = false;\n\n        const fail = error => {\n            if (done) return;\n            done = true;\n            try { socket.destroy(); } catch {}\n            reject(error instanceof Error ? error : new Error(String(error)));\n        };\n\n        socketTimeout(socket, timeout, fail);\n        socket.once(\"error\", fail);\n\n        socket.once(\"connect\", () => {\n            const methods = proxy.user ? [0x00, 0x02] : [0x00];\n            socket.write(Buffer.from([0x05, methods.length, ...methods]));\n\n            socket.once(\"data\", methodReply => {\n                if (methodReply.length < 2 || methodReply[0] !== 0x05) {\n                    return fail(new Error(\"SOCKS5 handshake inválido\"));\n                }\n                if (methodReply[1] === 0xff) {\n                    return fail(new Error(\"SOCKS5 sem método compatível\"));\n                }\n\n                const connectTarget = () => {\n                    const hostBuf = Buffer.from(host, \"utf8\");\n                    if (hostBuf.length > 255) return fail(new Error(\"hostname grande demais\"));\n\n                    const req = Buffer.concat([\n                        Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuf.length]),\n                        hostBuf,\n                        Buffer.from([(port >> 8) & 255, port & 255])\n                    ]);\n\n                    socket.write(req);\n                    socket.once(\"data\", reply => {\n                        if (reply.length < 2 || reply[1] !== 0x00) {\n                            return fail(new Error(`SOCKS5 CONNECT recusado (${reply[1] ?? \"?\"})`));\n                        }\n\n                        if (done) return;\n                        done = true;\n                        socket.setTimeout(0);\n                        socket.removeListener(\"error\", fail);\n                        resolve(socket);\n                    });\n                };\n\n                if (methodReply[1] === 0x02) {\n                    const u = Buffer.from(proxy.user, \"utf8\");\n                    const p = Buffer.from(proxy.pass, \"utf8\");\n\n                    if (u.length > 255 || p.length > 255) {\n                        return fail(new Error(\"credencial SOCKS5 longa demais\"));\n                    }\n\n                    socket.write(Buffer.concat([\n                        Buffer.from([0x01, u.length]),\n                        u,\n                        Buffer.from([p.length]),\n                        p\n                    ]));\n\n                    socket.once(\"data\", authReply => {\n                        if (authReply.length < 2 || authReply[1] !== 0x00) {\n                            return fail(new Error(\"autenticação SOCKS5 recusada\"));\n                        }\n                        connectTarget();\n                    });\n                } else {\n                    connectTarget();\n                }\n            });\n        });\n    });\n}\n\nasync function tlsProbe(proxy, hostname) {\n    const start = Date.now();\n    const raw = await socks5Tunnel(proxy, hostname, 443);\n\n    return await new Promise((resolve, reject) => {\n        let settled = false;\n\n        const secure = tls.connect({\n            socket: raw,\n            servername: hostname,\n            rejectUnauthorized: true\n        });\n\n        const fail = e => {\n            if (settled) return;\n            settled = true;\n            try { secure.destroy(); } catch {}\n            reject(e instanceof Error ? e : new Error(String(e)));\n        };\n\n        socketTimeout(secure, PROBE_TIMEOUT, fail);\n        secure.once(\"error\", fail);\n        secure.once(\"secureConnect\", () => {\n            if (settled) return;\n            settled = true;\n            secure.setTimeout(0);\n            secure.destroy();\n            resolve(Date.now() - start);\n        });\n    });\n}\n\nasync function countryThrough(proxy) {\n    const raw = await socks5Tunnel(proxy, \"cloudflare.com\", 443);\n\n    return await new Promise((resolve, reject) => {\n        let settled = false;\n        let data = \"\";\n\n        const secure = tls.connect({\n            socket: raw,\n            servername: \"cloudflare.com\",\n            rejectUnauthorized: true\n        });\n\n        const fail = e => {\n            if (settled) return;\n            settled = true;\n            try { secure.destroy(); } catch {}\n            reject(e instanceof Error ? e : new Error(String(e)));\n        };\n\n        socketTimeout(secure, PROBE_TIMEOUT, fail);\n        secure.once(\"error\", fail);\n\n        secure.once(\"secureConnect\", () => {\n            secure.write(\n                \"GET /cdn-cgi/trace HTTP/1.1\\r\\n\" +\n                \"Host: cloudflare.com\\r\\n\" +\n                \"Connection: close\\r\\n\\r\\n\"\n            );\n        });\n\n        secure.on(\"data\", chunk => {\n            data += chunk.toString(\"utf8\");\n            if (data.length > 20000) fail(new Error(\"trace grande demais\"));\n        });\n\n        secure.on(\"end\", () => {\n            if (settled) return;\n            const m = /\\bloc=([A-Z]{2})\\b/.exec(data);\n            if (!m) return fail(new Error(\"país não identificado\"));\n            settled = true;\n            resolve(m[1]);\n        });\n    });\n}\n\nasync function probeExit(proxy, excluded) {\n    const started = Date.now();\n\n    const country = await countryThrough(proxy);\n    if (excluded.has(country)) {\n        throw new Error(`país excluído: ${country}`);\n    }\n\n    await tlsProbe(proxy, \"gateway.discord.gg\");\n\n    return {\n        proxy,\n        country,\n        ms: Date.now() - started\n    };\n}\n\nfunction downloadText(url, timeout = SOURCE_TIMEOUT) {\n    return new Promise((resolve, reject) => {\n        const req = https.get(url, {\n            headers: {\n                \"User-Agent\": \"GoLiveBypassBD/1.6.5\"\n            }\n        }, res => {\n            if (res.statusCode < 200 || res.statusCode >= 300) {\n                res.resume();\n                reject(new Error(`HTTP ${res.statusCode}`));\n                return;\n            }\n\n            let body = \"\";\n            res.setEncoding(\"utf8\");\n\n            res.on(\"data\", chunk => {\n                body += chunk;\n                if (body.length > 4_000_000) {\n                    req.destroy(new Error(\"resposta grande demais\"));\n                }\n            });\n\n            res.on(\"end\", () => resolve(body));\n        });\n\n        req.setTimeout(timeout, () => req.destroy(new Error(\"timeout da fonte\")));\n        req.on(\"error\", reject);\n    });\n}\n\nfunction parseSource(type, body) {\n    const out = [];\n\n    if (type === \"plain\") {\n        for (const line of body.split(/\\r?\\n/)) {\n            const raw = line.trim();\n            if (!raw || raw.startsWith(\"#\")) continue;\n            const p = parseProxy(raw.includes(\"://\") ? raw : `socks5://${raw}`);\n            if (p) out.push(p);\n        }\n        return out;\n    }\n\n    const data = JSON.parse(body);\n    const entries = Array.isArray(data.proxies) ? data.proxies : [];\n\n    for (const item of entries) {\n        const p = parseProxy(String(item?.proxy || \"\"));\n        if (p) out.push(p);\n    }\n\n    return out;\n}\n\nfunction shuffled(list) {\n    const out = [...list];\n\n    for (let i = out.length - 1; i > 0; i--) {\n        const j = Math.floor(Math.random() * (i + 1));\n        [out[i], out[j]] = [out[j], out[i]];\n    }\n\n    return out;\n}\n\nasync function proxyCandidates(settings) {\n    const manualRaw = String(settings.manualProxy || \"\").trim();\n\n    if (manualRaw) {\n        const manual = parseProxy(manualRaw);\n        if (!manual) throw new Error(\"proxy manual inválida\");\n        return [manual];\n    }\n\n    const chunks = await Promise.all(\n        PROXY_SOURCES.map(async src => {\n            try {\n                const body = await downloadText(src.url);\n                log(`fonte ${src.type} ok (${body.length} bytes)`);\n                return parseSource(src.type, body);\n            } catch (e) {\n                log(`fonte ${src.type} falhou: ${e.message}`);\n                return [];\n            }\n        })\n    );\n\n    const unique = new Map();\n\n    for (const list of chunks) {\n        for (const proxy of list) {\n            const key = `${proxy.host}:${proxy.port}`;\n            if (!unique.has(key)) unique.set(key, proxy);\n        }\n    }\n\n    const all = [...unique.values()];\n    const picked = shuffled(all).slice(0, MAX_CANDIDATES);\n\n    writeStatus({\n        proxyCandidatesTotal: all.length,\n        proxyCandidatesTesting: picked.length\n    });\n\n    return picked;\n}\n\nfunction readStatusFile() {\n    try {\n        const parsed = JSON.parse(fs.readFileSync(STATUS, \"utf8\"));\n        return parsed && typeof parsed === \"object\" ? parsed : {};\n    } catch {\n        return {};\n    }\n}\n\nasync function reconnectGatewayAfterLateExit() {\n    const status = readStatusFile();\n\n    if (!status.pacActive) return false;\n    if (!status.directFallback && status.gatewayViaProxy !== false) return false;\n    if (!current) return false;\n\n    // Avoid reload/reconnect loops when several proxy probes finish together.\n    if (Date.now() - lastRecoveryReconnectAt < 15000) return false;\n    lastRecoveryReconnectAt = Date.now();\n\n    try {\n        writeStatus({\n            state: \"late-exit-reconnecting\",\n            directFallback: false,\n            gatewayViaProxy: null,\n            directReason: null,\n            recoveryProxy: safeProxy(current.proxy),\n            recoveryCountry: current.country\n        });\n\n        await session.defaultSession.closeAllConnections();\n\n        log(\n            `saída ficou pronta depois do DIRECT; fechando conexões para ` +\n            `o Gateway renascer por ${safeProxy(current.proxy)} (${current.country})`\n        );\n\n        return true;\n    } catch (e) {\n        log(`reconexão após saída tardia falhou: ${e.message}`);\n        return false;\n    }\n}\n\nasync function selectPool(force = false) {\n    // Never run two large proxy scans at the same time. \"force\" means retry\n    // when idle, not duplicate an in-flight selection.\n    if (selecting) return selecting;\n\n    selecting = (async () => {\n        selectionAttempt++;\n\n        const settings = readSettings();\n        const excluded = excludedSet(settings);\n\n        writeStatus({\n            state: \"selecting-exit\",\n            proxyAttempt: selectionAttempt,\n            proxySelectionError: null\n        });\n\n        const candidates = await proxyCandidates(settings);\n        if (!candidates.length) throw new Error(\"nenhuma proxy candidata\");\n\n        const start = Date.now();\n        const winners = [];\n        let cursor = 0;\n        const workerCount = Math.min(28, candidates.length);\n\n        const workers = Array.from({length: workerCount}, async () => {\n            while (\n                Date.now() - start < SELECTION_BUDGET &&\n                winners.length < POOL_SIZE\n            ) {\n                const i = cursor++;\n                if (i >= candidates.length) return;\n\n                const proxy = candidates[i];\n\n                try {\n                    const result = await probeExit(proxy, excluded);\n                    winners.push(result);\n\n                    log(`proxy aprovada ${safeProxy(proxy)} país=${result.country} ${result.ms}ms`);\n\n                    // Do not wait for the whole batch. The first validated exit\n                    // can already serve the waiting Discord Gateway.\n                    if (!current) {\n                        current = result;\n                        pool = [result];\n\n                        writeStatus({\n                            state: \"exit-ready-early\",\n                            country: result.country,\n                            proxy: safeProxy(result.proxy),\n                            ms: result.ms,\n                            proxyAttempt: selectionAttempt\n                        });\n\n                        void reconnectGatewayAfterLateExit();\n                    }\n                } catch (e) {\n                    log(`proxy rejeitada ${safeProxy(proxy)}: ${e.message}`);\n                }\n            }\n        });\n\n        await Promise.allSettled(workers);\n\n        if (!winners.length) {\n            const message = \"nenhuma saída não-BR respondeu ao Gateway\";\n\n            writeStatus({\n                state: \"proxy-search-failed\",\n                proxyAttempt: selectionAttempt,\n                proxySelectionError: message\n            });\n\n            throw new Error(message);\n        }\n\n        winners.sort((a, b) => a.ms - b.ms);\n\n        pool = winners.slice(0, POOL_SIZE);\n\n        if (!current || !winners.includes(current)) {\n            current = pool[0];\n        }\n\n        writeStatus({\n            state: \"exit-ready\",\n            country: current.country,\n            proxy: safeProxy(current.proxy),\n            ms: current.ms,\n            proxyAttempt: selectionAttempt,\n            proxySelectionError: null\n        });\n\n        // If the Gateway already gave up waiting and opened DIRECT, a usable\n        // exit becoming ready later must trigger a fresh Gateway connection.\n        void reconnectGatewayAfterLateExit();\n\n        return pool;\n    })().finally(() => {\n        selecting = null;\n    });\n\n    return selecting;\n}\n\nfunction waitForExit(timeout = HOLD_GATEWAY_MS) {\n    if (current) return Promise.resolve(current);\n\n    return new Promise(resolve => {\n        const start = Date.now();\n\n        const tick = () => {\n            if (current) return resolve(current);\n            if (Date.now() - start >= timeout) return resolve(null);\n            setTimeout(tick, 100);\n        };\n\n        tick();\n    });\n}\n\nfunction readSocksClientRequest(client) {\n    return new Promise((resolve, reject) => {\n        let stage = 0;\n        let buffer = Buffer.alloc(0);\n\n        const cleanup = () => {\n            client.off(\"data\", onData);\n            client.off(\"error\", onError);\n            client.setTimeout(0);\n        };\n\n        const fail = e => {\n            cleanup();\n            reject(e instanceof Error ? e : new Error(String(e)));\n        };\n\n        const onError = fail;\n\n        const onData = chunk => {\n            buffer = Buffer.concat([buffer, chunk]);\n\n            if (buffer.length > 8192) {\n                fail(new Error(\"handshake SOCKS grande demais\"));\n                return;\n            }\n\n            try {\n                if (stage === 0) {\n                    if (buffer.length < 2) return;\n                    const count = buffer[1];\n                    if (buffer.length < 2 + count) return;\n\n                    client.write(Buffer.from([0x05, 0x00]));\n                    buffer = buffer.subarray(2 + count);\n                    stage = 1;\n                }\n\n                if (stage !== 1) return;\n                if (buffer.length < 5) return;\n\n                if (buffer[0] !== 0x05 || buffer[1] !== 0x01) {\n                    throw new Error(\"apenas SOCKS CONNECT suportado\");\n                }\n\n                const atyp = buffer[3];\n                let host;\n                let offset;\n\n                if (atyp === 0x01) {\n                    if (buffer.length < 10) return;\n                    host = `${buffer[4]}.${buffer[5]}.${buffer[6]}.${buffer[7]}`;\n                    offset = 8;\n                } else if (atyp === 0x03) {\n                    const len = buffer[4];\n                    if (buffer.length < 7 + len) return;\n                    host = buffer.subarray(5, 5 + len).toString(\"utf8\");\n                    offset = 5 + len;\n                } else {\n                    throw new Error(\"ATYP não suportado\");\n                }\n\n                const port = (buffer[offset] << 8) | buffer[offset + 1];\n\n                cleanup();\n                resolve({host, port});\n            } catch (e) {\n                fail(e);\n            }\n        };\n\n        client.setTimeout(15000, () => fail(new Error(\"timeout cliente SOCKS\")));\n        client.on(\"error\", onError);\n        client.on(\"data\", onData);\n    });\n}\n\nfunction directConnect(host, port, timeout = 6000) {\n    return new Promise((resolve, reject) => {\n        const socket = trackSocket(net.connect(port, host));\n        let done = false;\n\n        const fail = error => {\n            if (done) return;\n            done = true;\n            try { socket.destroy(); } catch {}\n            reject(error instanceof Error ? error : new Error(String(error)));\n        };\n\n        socket.setTimeout(timeout, () => fail(new Error(\"timeout DIRECT\")));\n        socket.once(\"error\", fail);\n\n        socket.once(\"connect\", () => {\n            if (done) return;\n            done = true;\n            socket.setTimeout(0);\n            socket.removeListener(\"error\", fail);\n            resolve(socket);\n        });\n    });\n}\n\nasync function openDirectFallback(host, port, reason) {\n    lastGatewayViaProxy = false;\n\n    log(`FALLBACK DIRECT para ${host}:${port}: ${reason}`);\n\n    writeStatus({\n        state: \"degraded-direct\",\n        directFallback: true,\n        gatewayViaProxy: false,\n        directReason: reason,\n        directAt: new Date().toISOString()\n    });\n\n    return directConnect(host, port);\n}\n\nasync function openThroughPool(host, port) {\n    const ready = await waitForExit(HOLD_GATEWAY_MS);\n\n    if (!ready) {\n        selectPool(true).catch(e => log(`refresh após espera falhou: ${e.message}`));\n        return openDirectFallback(host, port, \"nenhuma saída proxy ficou pronta a tempo\");\n    }\n\n    const ordered = [];\n\n    if (current) ordered.push(current);\n\n    for (const item of pool) {\n        if (!ordered.includes(item)) ordered.push(item);\n    }\n\n    let last = null;\n\n    for (const item of ordered) {\n        try {\n            const socket = await socks5Tunnel(item.proxy, host, port, 6000);\n\n            lastGatewayViaProxy = true;\n\n            if (current !== item) {\n                current = item;\n                log(`saída trocada para ${safeProxy(item.proxy)}`);\n            }\n\n            writeStatus({\n                state: \"exit-in-use\",\n                directFallback: false,\n                gatewayViaProxy: true,\n                directReason: null\n            });\n\n            return socket;\n        } catch (e) {\n            last = e;\n            log(`saída ${safeProxy(item.proxy)} falhou no tráfego vivo: ${e.message}`);\n            pool = pool.filter(x => x !== item);\n\n            if (current === item) current = null;\n        }\n    }\n\n    selectPool(true).catch(e => log(`refresh de pool falhou: ${e.message}`));\n\n    return openDirectFallback(\n        host,\n        port,\n        last?.message || \"pool de proxies esgotado\"\n    );\n}\n\nasync function handleRouterClient(client) {\n    try {\n        const request = await readSocksClientRequest(client);\n\n        if (!routedHost(request.host)) {\n            client.write(Buffer.from([0x05, 0x02, 0, 1, 0,0,0,0, 0,0]));\n            client.destroy();\n            return;\n        }\n\n        log(`gateway visto: ${request.host}:${request.port}`);\n\n        const remote = await openThroughPool(request.host, request.port);\n\n        client.write(Buffer.from([0x05, 0x00, 0, 1, 127,0,0,1, 0,0]));\n        client.pipe(remote);\n        remote.pipe(client);\n\n        remote.on(\"error\", () => {\n            try { client.destroy(); } catch {}\n        });\n\n        client.on(\"error\", () => {\n            try { remote.destroy(); } catch {}\n        });\n\n        writeStatus({\n            state: \"gateway-routed\",\n            lastGatewayHost: request.host,\n            lastGatewayAt: new Date().toISOString(),\n            gatewayViaProxy: lastGatewayViaProxy,\n            directFallback: !lastGatewayViaProxy,\n            directReason: lastGatewayViaProxy\n                ? null\n                : \"gateway atual abriu em DIRECT\"\n        });\n    } catch (e) {\n        log(`router: ${e.message}`);\n\n        try {\n            client.write(Buffer.from([0x05, 0x01, 0, 1, 0,0,0,0, 0,0]));\n        } catch {}\n\n        try { client.destroy(); } catch {}\n    }\n}\n\nasync function startRouter() {\n    if (router) return router;\n\n    router = net.createServer(client => {\n        trackSocket(client);\n        handleRouterClient(client).catch(e => log(`cliente router: ${e.message}`));\n    });\n\n    await new Promise((resolve, reject) => {\n        router.once(\"error\", reject);\n        router.listen(0, \"127.0.0.1\", resolve);\n    });\n\n    routerPort = router.address().port;\n    log(`roteador local pronto em 127.0.0.1:${routerPort}`);\n\n    writeStatus({\n        state: \"router-ready\",\n        routerPort\n    });\n\n    return router;\n}\n\nfunction pacSource(fallback) {\n    return `\nfunction FindProxyForURL(url, host) {\n    host = String(host || \"\").toLowerCase();\n\n    if (\n        host === \"gateway.discord.gg\" ||\n        host === \"remote-auth-gateway.discord.gg\" ||\n        (host.indexOf(\"gateway-\") === 0 && dnsDomainIs(host, \".discord.gg\"))\n    ) {\n        return \"SOCKS5 127.0.0.1:${routerPort}\";\n    }\n\n    return ${JSON.stringify(fallback)};\n}\n`.trim();\n}\n\nasync function installPac() {\n    let fallback = \"DIRECT\";\n\n    try {\n        const system = await session.defaultSession.resolveProxy(\"https://discord.com\");\n        if (typeof system === \"string\" && system.trim()) {\n            fallback = system.trim();\n        }\n    } catch (e) {\n        log(`não consegui ler proxy do sistema: ${e.message}`);\n    }\n\n    const source = pacSource(fallback);\n    const url = \"data:application/x-ns-proxy-autoconfig;base64,\"\n        + Buffer.from(source, \"utf8\").toString(\"base64\");\n\n    await session.defaultSession.setProxy({\n        mode: \"pac_script\",\n        pacScript: url\n    });\n\n    const checks = await Promise.all([\n        session.defaultSession.resolveProxy(\"https://gateway.discord.gg\"),\n        session.defaultSession.resolveProxy(\"https://gateway-us-east1-b.discord.gg\"),\n        session.defaultSession.resolveProxy(\"https://discord.com\")\n    ]);\n\n    const gatewayOk = checks[0].includes(String(routerPort))\n        && checks[1].includes(String(routerPort));\n\n    if (!gatewayOk) {\n        await session.defaultSession.setProxy({mode: \"system\"});\n        throw new Error(`PAC não foi aplicada: ${checks.join(\" | \")}`);\n    }\n\n    log(`PAC nativa ativa: gateway -> 127.0.0.1:${routerPort}; resto -> ${fallback}`);\n\n    writeStatus({\n        state: \"pac-active\",\n        pacActive: true,\n        resolveGateway: checks[0],\n        resolveRegionalGateway: checks[1],\n        resolveDiscordCom: checks[2]\n    });\n\n}\n\nasync function forceGatewayReconnectAfterProxyReady() {\n    if (!current) {\n        writeStatus({\n            state: \"degraded-direct\",\n            directFallback: true,\n            directReason: \"nenhuma proxy validada; conexão atual não será derrubada\"\n        });\n        return false;\n    }\n\n    try {\n        await session.defaultSession.closeAllConnections();\n\n        log(\n            `proxy pronta (${current.country}); conexões antigas fechadas ` +\n            \"para o Gateway reconectar pela saída validada\"\n        );\n\n        lastGatewayViaProxy = false;\n\n        writeStatus({\n            state: \"proxy-ready-reconnecting\",\n            directFallback: false,\n            gatewayViaProxy: null,\n            directReason: null,\n            country: current.country,\n            proxy: safeProxy(current.proxy),\n            ms: current.ms\n        });\n\n        return true;\n    } catch (e) {\n        log(`closeAllConnections falhou: ${e.message}`);\n        return false;\n    }\n}\n\nasync function heartbeat() {\n    if (shuttingDown) return;\n\n    if (!current) {\n        try {\n            await selectPool(true);\n        } catch (e) {\n            log(`heartbeat sem saída: ${e.message}`);\n\n            writeStatus({\n                state: \"degraded-direct\",\n                proxyAttempt: selectionAttempt,\n                proxySelectionError: e.message\n            });\n        }\n\n        return;\n    }\n\n    try {\n        const ms = await tlsProbe(current.proxy, \"gateway.discord.gg\");\n        current.ms = ms;\n\n        writeStatus({\n            state: \"healthy\",\n            heartbeatMs: ms\n        });\n    } catch (e) {\n        log(`heartbeat derrubou ${safeProxy(current.proxy)}: ${e.message}`);\n\n        pool = pool.filter(x => x !== current);\n        current = pool[0] || null;\n\n        if (!current) {\n            try { await selectPool(true); } catch (refreshError) {\n                log(`não consegui repor pool: ${refreshError.message}`);\n            }\n        }\n\n        writeStatus({state: \"exit-degraded\"});\n    }\n}\n\nconst SELF_HOOK_BEGIN = \"/* GoLiveBypassBD:NATIVE-HOOK:BEGIN */\";\nconst SELF_HOOK_END = \"/* GoLiveBypassBD:NATIVE-HOOK:END */\";\n\nfunction stripSelfMarker(content) {\n    const begin = content.indexOf(SELF_HOOK_BEGIN);\n    if (begin < 0) return content;\n\n    const end = content.indexOf(SELF_HOOK_END, begin);\n    if (end < 0) return content;\n\n    return content.slice(0, begin)\n        + content.slice(end + SELF_HOOK_END.length).replace(/^\\r?\\n/, \"\");\n}\n\nfunction selfMarkerBlock() {\n    return [\n        SELF_HOOK_BEGIN,\n        \"try { require(\" + JSON.stringify(__filename) + \"); }\",\n        \"catch (e) { console.error('[GoLiveBypassBD/native-hook]', e); }\",\n        SELF_HOOK_END,\n        \"\"\n    ].join(\"\\n\");\n}\n\nfunction repairOwnInjection() {\n    const settings = readSettings();\n    const coreIndex = String(settings.coreIndex || \"\").trim();\n\n    if (!coreIndex) {\n        writeStatus({\n            injectionPersistent: false,\n            injectionReason: \"coreIndex ausente no settings.json\"\n        });\n        return false;\n    }\n\n    try {\n        if (!fs.existsSync(coreIndex)) {\n            writeStatus({\n                injectionPersistent: false,\n                injectionReason: \"coreIndex não existe: \" + coreIndex\n            });\n            return false;\n        }\n\n        const original = fs.readFileSync(coreIndex, \"utf8\");\n\n        const escapedSelfPath = JSON.stringify(__filename);\n\n        if (\n            original.includes(SELF_HOOK_BEGIN) &&\n            original.includes(SELF_HOOK_END) &&\n            original.includes(escapedSelfPath)\n        ) {\n            writeStatus({\n                injectionPersistent: true,\n                injectionPath: coreIndex,\n                injectionReason: null\n            });\n            return true;\n        }\n\n        const clean = stripSelfMarker(original);\n        const wanted = selfMarkerBlock() + clean;\n\n        fs.writeFileSync(coreIndex, wanted, \"utf8\");\n\n        const verify = fs.readFileSync(coreIndex, \"utf8\");\n        const ok = verify.includes(SELF_HOOK_BEGIN)\n            && verify.includes(SELF_HOOK_END)\n            && verify.includes(escapedSelfPath);\n\n        writeStatus({\n            injectionPersistent: ok,\n            injectionPath: coreIndex,\n            injectionReason: ok ? null : \"verificação após write falhou\"\n        });\n\n        if (ok) {\n            log(`injeção persistente reparada em ${coreIndex}`);\n        }\n\n        return ok;\n    } catch (e) {\n        log(`self-heal da injeção falhou: ${e.message}`);\n\n        writeStatus({\n            injectionPersistent: false,\n            injectionPath: coreIndex,\n            injectionReason: e.message\n        });\n\n        return false;\n    }\n}\n\nasync function start() {\n    mkdir();\n\n    const settings = readSettings();\n\n    log(\"--- main hook v1.6.5 carregado ---\");\n\n    writeStatus({\n        state: \"hook-loaded\",\n        hookLoaded: true,\n        enabled: settings.enabled !== false,\n        electron: process.versions.electron || null,\n        directFallback: false\n    });\n\n    if (settings.enabled === false) {\n        log(\"hook desativado pelas configurações\");\n        return;\n    }\n\n    await startRouter();\n\n    // Start proxy discovery BEFORE installing the PAC. Discovery traffic therefore\n    // uses the normal system route and gets a head start before the Gateway is moved.\n    const selectionPromise = selectPool()\n        .then(result => result)\n        .catch(e => {\n            log(`seleção inicial falhou: ${e.message}`);\n\n            writeStatus({\n                state: \"degraded-direct\",\n                directFallback: true,\n                directReason: e.message,\n                error: e.message\n            });\n\n            return null;\n        });\n\n    try {\n        await installPac();\n    } catch (e) {\n        // If PAC itself cannot be installed, do not damage the Discord session.\n        log(`PAC não pôde ser instalada; mantendo rede normal: ${e.message}`);\n\n        try {\n            await session.defaultSession.setProxy({mode: \"system\"});\n        } catch {}\n\n        writeStatus({\n            state: \"pac-error-direct\",\n            pacActive: false,\n            directFallback: true,\n            directReason: e.message,\n            error: e.message\n        });\n\n        return;\n    }\n\n    // Only tear down the existing Gateway after an exit has actually been validated.\n    const selected = await selectionPromise;\n\n    if (selected && current) {\n        await forceGatewayReconnectAfterProxyReady();\n    } else {\n        log(\"nenhuma proxy validada; Discord continuará em modo degradado/DIRECT\");\n\n        writeStatus({\n            state: \"degraded-direct\",\n            pacActive: true,\n            directFallback: true,\n            directReason: \"nenhuma saída não-BR validada\"\n        });\n    }\n\n    // BetterDiscord/Discord may rewrite discord_desktop_core during startup.\n    // Repair our one-line loader after the client settles so the next restart\n    // still loads the native hook.\n    clearNativeTimers();\n\n    startupRepairTimer = setTimeout(() => {\n        startupRepairTimer = null;\n        repairOwnInjection();\n    }, 5000);\n\n    heartbeatTimer = setInterval(() => {\n        heartbeat().catch(e => log(`heartbeat interno: ${e.message}`));\n    }, HEARTBEAT_MS);\n\n    // Re-check persistence occasionally; this only writes when the marker vanished.\n    repairTimer = setInterval(() => {\n        repairOwnInjection();\n    }, 60000);\n}\n\nfunction begin() {\n    if (globalThis[NATIVE_SINGLETON_KEY]) {\n        log(\"hook nativo já estava ativo neste processo; ignorando segunda inicialização\");\n        return;\n    }\n\n    globalThis[NATIVE_SINGLETON_KEY] = true;\n\n    start().catch(e => {\n        log(`FATAL: ${e.stack || e.message}`);\n        writeStatus({\n            state: \"fatal\",\n            error: e.message\n        });\n    });\n}\n\napp.once(\"before-quit\", () => {\n    shuttingDown = true;\n\n    clearNativeTimers();\n    destroyActiveSockets();\n\n    try { router?.close(); } catch {}\n    router = null;\n\n    globalThis[NATIVE_SINGLETON_KEY] = false;\n});\n\n// This module is loaded by discord_desktop_core very early.\nif (app.isReady()) {\n    begin();\n} else {\n    app.once(\"ready\", begin);\n}\n";
 
 module.exports = class GoLiveBypassBD {
     constructor() {
@@ -33,7 +35,8 @@ module.exports = class GoLiveBypassBD {
             excludedCountries: "BR",
             manualProxy: "",
             voiceRegion: "",
-            autoUpdate: true
+            autoUpdate: true,
+            autoInstallUpdates: false
         }, this.api.Data.load("settings") || {});
 
         this.videoGuardTarget = null;
@@ -54,10 +57,12 @@ module.exports = class GoLiveBypassBD {
         this._timeouts = new Set();
         this._updateInterval = null;
         this._checkingUpdate = false;
+        this._updateStatus = "aguardando";
+        this._latestVersion = PLUGIN_VERSION;
+        this._updateAvailableVersion = null;
+        this._lastUpdateCheckAt = null;
         this._serverProxyWaitChecks = 0;
         this._serverProxyWaitScheduled = false;
-        this._rendererStartedAt = Date.now();
-        this._mediaRecoveryScheduled = false;
     }
 
     schedule(callback, delay) {
@@ -94,8 +99,6 @@ module.exports = class GoLiveBypassBD {
         this._stopped = false;
         this._serverProxyWaitChecks = 0;
         this._serverProxyWaitScheduled = false;
-        this._rendererStartedAt = Date.now();
-        this._mediaRecoveryScheduled = false;
         this.clearRuntimeTimers();
         this.saveSettingsAndNativeConfig();
 
@@ -1146,105 +1149,6 @@ module.exports = class GoLiveBypassBD {
         return false;
     }
 
-    lastHandledGatewayReconnect() {
-        const value = Number(
-            this.api.Data.load("lastHandledGatewayReconnect") || 0
-        );
-
-        return Number.isFinite(value) ? value : 0;
-    }
-
-    markGatewayReconnectHandled(timestamp) {
-        this.api.Data.save(
-            "lastHandledGatewayReconnect",
-            Number(timestamp) || Date.now()
-        );
-    }
-
-    maybeRecoverMediaAfterGatewayReconnect() {
-        if (this._stopped || this._mediaRecoveryScheduled) return false;
-
-        const native = this.readNativeStatus();
-
-        if (
-            !native?.pacActive ||
-            native?.gatewayViaProxy !== true ||
-            native?.directFallback === true
-        ) {
-            return false;
-        }
-
-        const forcedAt = new Date(
-            native.gatewayReconnectForcedAt || 0
-        ).getTime();
-
-        if (!Number.isFinite(forcedAt) || forcedAt <= 0) {
-            return false;
-        }
-
-        // Only react to a reconnect that belongs to this startup window.
-        if (Date.now() - forcedAt > 120_000) {
-            return false;
-        }
-
-        if (forcedAt <= this.lastHandledGatewayReconnect()) {
-            return false;
-        }
-
-        if (this.hasActiveStreamMedia()) {
-            // Never auto-reload under an active voice/stream connection.
-            return false;
-        }
-
-        this._mediaRecoveryScheduled = true;
-        this.markGatewayReconnectHandled(forcedAt);
-
-        BdApi.UI.showToast(
-            "Go Live De Queijo: finalizando a reconexão do Gateway...",
-            {type: "info", timeout: 3500}
-        );
-
-        this.schedule(() => {
-            try {
-                window.location.reload();
-            } catch (e) {
-                this.api.Logger.error(
-                    "Falha ao limpar estado RTC após reconexão",
-                    e
-                );
-            }
-        }, 900);
-
-        return true;
-    }
-
-    recoverLoadingManually() {
-        if (this.hasActiveStreamMedia()) {
-            BdApi.UI.showConfirmationModal(
-                "Corrigir loading",
-                "Há uma call ou transmissão ativa. Recarregar o Discord vai reconectar a mídia. Deseja continuar?",
-                {
-                    confirmText: "Recarregar",
-                    cancelText: "Cancelar",
-                    onConfirm: () => {
-                        try { window.location.reload(); } catch {}
-                    }
-                }
-            );
-
-            return;
-        }
-
-        try {
-            window.location.reload();
-        } catch (e) {
-            BdApi.UI.alert(
-                "Go Live De Queijo",
-                `Não consegui recarregar o Discord:\n\n${e.message}`
-            );
-        }
-    }
-
     sessionRetryState() {
         const saved = this.api.Data.load("sessionRetryState");
 
@@ -1328,10 +1232,6 @@ module.exports = class GoLiveBypassBD {
                 `Go Live De Queijo: sessão liberada pelo servidor${country !== "?" ? " via " + country : ""}.`,
                 {type: "success", timeout: 5000}
             );
-
-            if (this.maybeRecoverMediaAfterGatewayReconnect()) {
-                return;
-            }
 
             return;
         }
@@ -1591,7 +1491,7 @@ module.exports = class GoLiveBypassBD {
         const status = this.readNativeStatus();
 
         const lines = [
-            "Go Live De Queijo v1.6.4",
+            "Go Live De Queijo v1.6.5",
             "",
             "== NATIVE HOOK ==",
             `instalado/ativo: ${this.isNativeHookInstalled() ? "SIM" : "NÃO"}`,
@@ -1623,9 +1523,6 @@ module.exports = class GoLiveBypassBD {
             lines.push(`lastGatewayHost: ${status.lastGatewayHost || "?"}`);
             lines.push(`lastGatewayAt: ${status.lastGatewayAt || "?"}`);
             lines.push(`gatewayViaProxy: ${status.gatewayViaProxy ?? "?"}`);
-            lines.push(`gatewayReconnectForcedAt: ${status.gatewayReconnectForcedAt || "-"}`);
-            lines.push(`gatewayReconnectReason: ${status.gatewayReconnectReason || "-"}`);
-            lines.push(`gatewayReconnectSkipped: ${status.gatewayReconnectSkipped ?? "?"}`);
             lines.push(`directFallback: ${status.directFallback ?? false}`);
             lines.push(`directReason: ${status.directReason || "-"}`);
             lines.push(`injectionPersistent: ${status.injectionPersistent ?? "?"}`);
@@ -1665,6 +1562,16 @@ module.exports = class GoLiveBypassBD {
         } catch {}
 
         lines.push(
+            "",
+            "== UPDATER ==",
+            `repo: ${GITHUB_REPO}`,
+            `versão instalada: ${PLUGIN_VERSION}`,
+            `última versão vista: ${this._latestVersion || "?"}`,
+            `update disponível: ${this._updateAvailableVersion || "NÃO"}`,
+            `estado: ${this._updateStatus || "?"}`,
+            `última checagem: ${this._lastUpdateCheckAt || "-"}`,
+            `detecção automática: ${this.settings.autoUpdate ? "SIM" : "NÃO"}`,
+            `instalação automática: ${this.settings.autoInstallUpdates ? "SIM" : "NÃO"}`,
             "",
             "== ARQUIVOS ==",
             `settings: ${this.nativeSettingsPath}`,
@@ -1834,6 +1741,7 @@ module.exports = class GoLiveBypassBD {
         const target = this.findOwnPluginPath();
 
         try {
+            this._updateStatus = `instalando v${version}`;
             const current = fs.existsSync(target)
                 ? fs.readFileSync(target, "utf8")
                 : "";
@@ -1851,11 +1759,17 @@ module.exports = class GoLiveBypassBD {
 
             fs.writeFileSync(target, source, "utf8");
 
+            this._latestVersion = version;
+            this._updateAvailableVersion = null;
+            this._updateStatus = `atualizado para v${version}`;
+            this.api.Data.save("lastInstalledUpdateVersion", version);
+
             BdApi.UI.showToast(
                 `Go Live De Queijo atualizado para v${version}.`,
                 {type: "success", timeout: 6000}
             );
         } catch (e) {
+            this._updateStatus = `erro ao instalar: ${e.message}`;
             this.api.Logger.error("Falha ao instalar atualização", e);
 
             BdApi.UI.alert(
@@ -1866,18 +1780,21 @@ module.exports = class GoLiveBypassBD {
     }
 
     async checkForUpdates(manual = false) {
-        if (this._checkingUpdate) return;
+        if (this._checkingUpdate) return null;
 
         const url = this.githubRawUpdateUrl();
 
         this._checkingUpdate = true;
+        this._updateStatus = "verificando GitHub...";
+        this._lastUpdateCheckAt = new Date().toISOString();
 
         try {
             const response = await BdApi.Net.fetch(
                 `${url}?v=${Date.now()}`,
                 {
                     headers: {
-                        "Cache-Control": "no-cache"
+                        "Cache-Control": "no-cache",
+                        "Pragma": "no-cache"
                     }
                 }
             );
@@ -1888,14 +1805,17 @@ module.exports = class GoLiveBypassBD {
 
             const remoteSource = await response.text();
 
-            // Keep a sane ceiling before ever writing downloaded source to disk.
             if (remoteSource.length < 500 || remoteSource.length > 2_000_000) {
                 throw new Error("tamanho do plugin remoto fora do esperado");
             }
 
             const remoteVersion = this.validateRemotePlugin(remoteSource);
+            this._latestVersion = remoteVersion;
 
             if (this.compareVersions(remoteVersion, PLUGIN_VERSION) <= 0) {
+                this._updateAvailableVersion = null;
+                this._updateStatus = `em dia • v${PLUGIN_VERSION}`;
+
                 if (manual) {
                     BdApi.UI.showToast(
                         `Você já está na versão mais recente (v${PLUGIN_VERSION}).`,
@@ -1903,28 +1823,57 @@ module.exports = class GoLiveBypassBD {
                     );
                 }
 
-                return;
+                return {available: false, version: remoteVersion};
             }
 
-            const update = () =>
-                this.installRemoteUpdate(remoteSource, remoteVersion);
+            this._updateAvailableVersion = remoteVersion;
+            this._updateStatus = `nova versão • v${remoteVersion}`;
 
-            if (typeof BdApi.UI.showConfirmationModal === "function") {
-                BdApi.UI.showConfirmationModal(
-                    "Atualização disponível",
-                    `Go Live De Queijo v${remoteVersion} está disponível no GitHub.\n\nVersão atual: v${PLUGIN_VERSION}`,
-                    {
-                        confirmText: "Atualizar",
-                        cancelText: "Depois",
-                        onConfirm: update
-                    }
-                );
-            } else if (window.confirm(
-                `Go Live De Queijo v${remoteVersion} está disponível. Atualizar agora?`
-            )) {
-                await update();
+            if (this.settings.autoInstallUpdates) {
+                await this.installRemoteUpdate(remoteSource, remoteVersion);
+                return {
+                    available: true,
+                    installed: true,
+                    version: remoteVersion
+                };
             }
+
+            const lastNotified = String(
+                this.api.Data.load("lastNotifiedUpdateVersion") || ""
+            );
+
+            const shouldNotify = manual || lastNotified !== remoteVersion;
+
+            if (shouldNotify) {
+                this.api.Data.save("lastNotifiedUpdateVersion", remoteVersion);
+
+                const update = () =>
+                    this.installRemoteUpdate(remoteSource, remoteVersion);
+
+                if (typeof BdApi.UI.showConfirmationModal === "function") {
+                    BdApi.UI.showConfirmationModal(
+                        "Atualização disponível",
+                        `Go Live De Queijo v${remoteVersion} está disponível.\n\nVersão atual: v${PLUGIN_VERSION}`,
+                        {
+                            confirmText: "Atualizar",
+                            cancelText: "Depois",
+                            onConfirm: update
+                        }
+                    );
+                } else if (window.confirm(
+                    `Go Live De Queijo v${remoteVersion} está disponível. Atualizar agora?`
+                )) {
+                    await update();
+                }
+            }
+
+            return {
+                available: true,
+                installed: false,
+                version: remoteVersion
+            };
         } catch (e) {
+            this._updateStatus = `erro: ${e.message}`;
             this.api.Logger.warn("Falha ao verificar atualização", e);
 
             if (manual) {
@@ -1933,6 +1882,11 @@ module.exports = class GoLiveBypassBD {
                     `Não consegui verificar atualizações:\n\n${e.message}`
                 );
             }
+
+            return {
+                available: false,
+                error: e.message
+            };
         } finally {
             this._checkingUpdate = false;
         }
@@ -1948,7 +1902,7 @@ module.exports = class GoLiveBypassBD {
 
         this.schedule(() => {
             this.checkForUpdates(false);
-        }, 8000);
+        }, 4000);
 
         this._updateInterval = setInterval(() => {
             if (this._stopped) return;
@@ -2116,7 +2070,7 @@ module.exports = class GoLiveBypassBD {
             React.createElement(
                 "div",
                 {style: {display: "flex", flexDirection: "column", gap: "4px"}},
-                React.createElement("h2", {style: {margin: 0}}, "Go Live De Queijo v1.6.4"),
+                React.createElement("h2", {style: {margin: 0}}, "Go Live De Queijo v1.6.5"),
                 React.createElement(
                     "div",
                     {style: {fontSize: "12px", color: "var(--text-muted)"}},
@@ -2332,6 +2286,123 @@ module.exports = class GoLiveBypassBD {
                             )
                         )
                     )
+                ),
+
+                field(
+                    "Instalar updates automaticamente",
+                    "Se ativado, baixa e substitui o plugin sem pedir confirmação.",
+                    React.createElement(
+                        "div",
+                        {style: toggleWrapStyle},
+                        React.createElement(
+                            "div",
+                            {
+                                style: {
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: "10px"
+                                }
+                            },
+                            React.createElement(
+                                "span",
+                                {style: toggleTextStyle(!!this.settings.autoInstallUpdates)},
+                                this.settings.autoInstallUpdates ? "Ativado" : "Desativado"
+                            ),
+                            React.createElement(
+                                "button",
+                                {
+                                    type: "button",
+                                    style: toggleButtonStyle(!!this.settings.autoInstallUpdates),
+                                    onClick: () => {
+                                        save(
+                                            "autoInstallUpdates",
+                                            !this.settings.autoInstallUpdates
+                                        );
+
+                                        if (
+                                            this.settings.autoInstallUpdates &&
+                                            this._updateAvailableVersion
+                                        ) {
+                                            plugin.checkForUpdates(true);
+                                        }
+                                    },
+                                    title: this.settings.autoInstallUpdates ? "Desativar" : "Ativar",
+                                    "aria-label": this.settings.autoInstallUpdates
+                                        ? "Desativar instalação automática"
+                                        : "Ativar instalação automática"
+                                },
+                                React.createElement("span", {style: toggleKnobStyle})
+                            )
+                        )
+                    )
+                )
+            ),
+
+            React.createElement(
+                "div",
+                {style: cardStyle},
+                React.createElement("div", {style: sectionTitleStyle}, "Atualizações"),
+                React.createElement(
+                    "div",
+                    {
+                        style: {
+                            display: "grid",
+                            gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
+                            gap: "10px"
+                        }
+                    },
+                    React.createElement(
+                        "div",
+                        {
+                            style: {
+                                border: "1px solid var(--background-modifier-accent)",
+                                borderRadius: "10px",
+                                padding: "12px"
+                            }
+                        },
+                        React.createElement(
+                            "div",
+                            {
+                                style: {
+                                    fontSize: "12px",
+                                    color: "var(--text-muted)",
+                                    marginBottom: "4px"
+                                }
+                            },
+                            "Versão instalada"
+                        ),
+                        React.createElement(
+                            "div",
+                            {style: {fontSize: "15px", fontWeight: 700}},
+                            `v${PLUGIN_VERSION}`
+                        )
+                    ),
+                    React.createElement(
+                        "div",
+                        {
+                            style: {
+                                border: "1px solid var(--background-modifier-accent)",
+                                borderRadius: "10px",
+                                padding: "12px"
+                            }
+                        },
+                        React.createElement(
+                            "div",
+                            {
+                                style: {
+                                    fontSize: "12px",
+                                    color: "var(--text-muted)",
+                                    marginBottom: "4px"
+                                }
+                            },
+                            "Updater"
+                        ),
+                        React.createElement(
+                            "div",
+                            {style: {fontSize: "15px", fontWeight: 700}},
+                            this._updateStatus || "aguardando"
+                        )
+                    )
                 )
             ),
 
@@ -2381,17 +2452,6 @@ module.exports = class GoLiveBypassBD {
                             onClick: () => plugin.checkForUpdates(true)
                         },
                         "Buscar atualização"
-                    ),
-                    React.createElement(
-                        "button",
-                        {
-                            style: Object.assign({}, buttonBaseStyle, {
-                                background: "var(--button-secondary-background)",
-                                color: "var(--text-normal)"
-                            }),
-                            onClick: () => plugin.recoverLoadingManually()
-                        },
-                        "Corrigir loading"
                     ),
                     React.createElement(
                         "button",
