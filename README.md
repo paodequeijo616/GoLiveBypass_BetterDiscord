@@ -258,6 +258,8 @@ Rotas SOCKS5 públicas são serviços de terceiros e podem ficar lentas, offline
 
 O plugin prioriza a conexão DIRECT sempre que possível.
 
+⚠️ Aviso: Este é um plugin não oficial que modifica o cliente Discord através do BetterDiscord. Modificações no cliente podem violar os Termos de Serviço do Discord e existe risco de punição da conta. O plugin também pode utilizar proxies públicas e componentes de rede de terceiros. Use por sua conta e risco.
+
 ---
 
 # Repositório
