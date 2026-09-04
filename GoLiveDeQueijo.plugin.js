@@ -3,7 +3,7 @@
  * @author Pão de Queijo
  * @authorId 416992570846085121
  * @description Plugin BetterDiscord para dar bypass na granja
- * @version 1.9.17
+ * @version 1.10.7
  * @source https://github.com/paodequeijo616/GoLiveBypass_BetterDiscord
  * @updateUrl https://raw.githubusercontent.com/paodequeijo616/GoLiveBypass_BetterDiscord/main/GoLiveDeQueijo.plugin.js
  * @downloadUrl https://raw.githubusercontent.com/paodequeijo616/GoLiveBypass_BetterDiscord/main/GoLiveDeQueijo.plugin.js
@@ -16,7 +16,7 @@ const path = require("path");
 
 const VIDEO_GUARD = "2026-08-video-guard";
 const PLUGIN_NAME = "Go Live De Queijo";
-const PLUGIN_VERSION = "1.9.17";
+const PLUGIN_VERSION = "1.10.7";
 const PLUGIN_AUTHOR_ID = "416992570846085121";
 const GITHUB_REPO = "paodequeijo616/GoLiveBypass_BetterDiscord";
 const UPDATE_FILE_NAME = "GoLiveDeQueijo.plugin.js";
