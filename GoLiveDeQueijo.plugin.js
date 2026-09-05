@@ -25,7 +25,7 @@ const UPDATE_INTERVAL_MS = 30 * 60 * 1000;
 
 // BETA DIRETA:
 // não deixa esta build trocar de versão sozinha enquanto testamos.
-const TEST_BUILD_DISABLE_AUTO_UPDATE = true;
+const TEST_BUILD_DISABLE_AUTO_UPDATE = false;
 
 // Nesta beta o objetivo é provar o bypass LOCAL/DIRECT.
 // Nenhum fallback TUN/SOCKS será solicitado automaticamente.
